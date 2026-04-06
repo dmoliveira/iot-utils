@@ -8,7 +8,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +34,43 @@ PORT = "🔌"
 SAVE = "💾"
 CFG = "🧾"
 DONE = "🎉"
+STEP = "📦"
+TIME = "⏱️"
+
+LOGGER: "RunLogger | None" = None
 
 
 class IotUtilsError(RuntimeError):
     pass
+
+
+class RunLogger:
+    def __init__(self, log_path: Path) -> None:
+        self.log_path = log_path
+        self.start_monotonic = time.monotonic()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.log_path.open("w", encoding="utf-8")
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def timestamp(self) -> str:
+        return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+
+    def elapsed(self) -> str:
+        total = time.monotonic() - self.start_monotonic
+        minutes, seconds = divmod(total, 60)
+        if minutes >= 1:
+            return f"{int(minutes)}m {seconds:.1f}s"
+        return f"{seconds:.1f}s"
+
+    def write(self, text: str = "") -> None:
+        print(text)
+        self.handle.write(text + "\n")
+        self.handle.flush()
+
+    def is_empty(self) -> bool:
+        return self.handle.tell() == 0
 
 
 @dataclass
@@ -54,11 +89,52 @@ class SketchContext:
 
 
 def emit(icon: str, message: str) -> None:
-    print(f"{icon} {message}")
+    if LOGGER:
+        LOGGER.write(f"{icon} {message}")
+    else:
+        print(f"{icon} {message}")
+
+
+def emit_block(title: str, *, icon: str = STEP) -> None:
+    prefix = LOGGER.timestamp() if LOGGER else datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    line = f"{prefix} {icon} {title}"
+    if LOGGER:
+        if not LOGGER.is_empty():
+            LOGGER.write("")
+        LOGGER.write(line)
+    else:
+        print()
+        print(line)
+
+
+def emit_command_output(title: str, output: str) -> None:
+    if not output:
+        return
+    emit_block(title, icon=INFO)
+    for line in output.splitlines():
+        emit("│", line)
+
+
+def set_logger(log_path: Path) -> None:
+    global LOGGER
+    if LOGGER:
+        LOGGER.close()
+    LOGGER = RunLogger(log_path)
+
+
+def close_logger() -> None:
+    global LOGGER
+    if LOGGER:
+        LOGGER.close()
+        LOGGER = None
 
 
 def fail(message: str, code: int = 1) -> None:
+    if LOGGER:
+        emit_block("Run failed", icon=FAIL)
     emit(FAIL, message)
+    if LOGGER:
+        emit(TIME, f"Total run time: {LOGGER.elapsed()}")
     raise SystemExit(code)
 
 
@@ -266,14 +342,19 @@ def ensure_arduino_cli() -> None:
     emit(OK, f"arduino-cli found: {version}")
 
 
-def resolve_sketch(sketch_arg: str) -> Path:
+def resolve_sketch(sketch_arg: str, *, announce: bool = True) -> Path:
     sketch = Path(sketch_arg).expanduser().resolve()
     if not sketch.exists():
         raise IotUtilsError(f"Sketch not found: {sketch}")
     if sketch.suffix.lower() != ".ino":
         raise IotUtilsError(f"Expected a .ino sketch file, got: {sketch.name}")
-    emit(OK, f"Sketch found: {sketch}")
+    if announce:
+        emit(OK, f"Sketch found: {sketch}")
     return sketch
+
+
+def log_path_for_sketch(sketch_file: Path) -> Path:
+    return sketch_file.parent / f"{sketch_file.stem}.iot-utils.log"
 
 
 def prepare_sketch_dir(sketch_file: Path) -> tuple[Path, bool]:
@@ -592,13 +673,17 @@ def infer_fqbn(config: dict[str, Any], requested_fqbn: str | None, selected_port
         emit(OK, f"Auto-detected FQBN: {unique_fqbns[0]}")
         return unique_fqbns[0], unique_fqbns[0]
 
+    default_fqbn = config.get("default_fqbn")
+    resolved_default, label = resolve_fqbn_reference(str(default_fqbn), config) if default_fqbn else (None, None)
+
     if selected_port and require_detected_for_port:
         if len(unique_fqbns) > 1:
             raise IotUtilsError(f"Selected port matches multiple board types ({', '.join(unique_fqbns)}). Pass --fqbn explicitly.")
-        raise IotUtilsError("Selected upload port did not report a unique board type. Pass --fqbn explicitly to avoid uploading to the wrong target.")
+        if resolved_default:
+            emit(WARN, f"Selected upload port did not report a unique board type; falling back to configured default: {resolved_default}")
+            return resolved_default, label or resolved_default
+        raise IotUtilsError("Selected upload port did not report a unique board type. Pass --fqbn explicitly or set default_fqbn in config to avoid uploading to the wrong target.")
 
-    default_fqbn = config.get("default_fqbn")
-    resolved_default, label = resolve_fqbn_reference(str(default_fqbn), config) if default_fqbn else (None, None)
     if resolved_default:
         emit(WARN, f"FQBN auto-detect was not conclusive; falling back to config default: {resolved_default}")
         return resolved_default, label or resolved_default
@@ -688,16 +773,15 @@ def enforce_resource_limits(output: str, config: dict[str, Any]) -> None:
 
 def compile_sketch(ctx: SketchContext) -> None:
     ctx.build_path.mkdir(parents=True, exist_ok=True)
+    emit_block("Compile", icon=RUN)
     emit(RUN, f"Compiling sketch for {ctx.fqbn}...")
     command = ["arduino-cli", "compile", "--warnings", "all", "--fqbn", ctx.fqbn, "--build-path", str(ctx.build_path), str(ctx.sketch_dir)]
     result = run_command(command, check=False)
     combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
     if result.returncode != 0:
-        if combined_output:
-            print(combined_output)
+        emit_command_output("Compiler details", combined_output)
         raise IotUtilsError("Compile failed.")
-    if combined_output:
-        print(combined_output)
+    emit_command_output("Compiler details", combined_output)
     emit(OK, "Compile completed successfully.")
     enforce_resource_limits(combined_output, ctx.config)
 
@@ -705,6 +789,7 @@ def compile_sketch(ctx: SketchContext) -> None:
 def upload_sketch(ctx: SketchContext) -> None:
     if not ctx.port:
         raise IotUtilsError("Upload requested without a selected serial port.")
+    emit_block("Upload", icon=RUN)
     emit(RUN, f"Uploading sketch to {ctx.port} at {ctx.upload_speed} baud...")
     command = [
         "arduino-cli",
@@ -722,16 +807,14 @@ def upload_sketch(ctx: SketchContext) -> None:
     result = run_command(command, check=False)
     combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
     if result.returncode != 0:
-        if combined_output:
-            print(combined_output)
+        emit_command_output("Uploader details", combined_output)
         raise IotUtilsError("Upload failed.")
-    if combined_output:
-        print(combined_output)
+    emit_command_output("Uploader details", combined_output)
     emit(DONE, f"Upload completed successfully on {ctx.port}.")
 
 
 def show_resolved_parameters(command_name: str, ctx: SketchContext) -> None:
-    emit(CFG, f"Resolved parameters for {command_name}:")
+    emit_block(f"Resolved parameters for {command_name}", icon=CFG)
     emit(INFO, f"Sketch file: {ctx.sketch_file}")
     emit(INFO, f"Sketch dir: {ctx.sketch_dir}")
     emit(INFO, f"FQBN: {ctx.fqbn} (input: {ctx.fqbn_label})")
@@ -743,15 +826,22 @@ def show_resolved_parameters(command_name: str, ctx: SketchContext) -> None:
 
 
 def build_context(args: argparse.Namespace, *, upload: bool) -> SketchContext:
+    sketch_file = resolve_sketch(args.sketch, announce=False)
+    set_logger(log_path_for_sketch(sketch_file))
+    emit_block(f"{'Upload' if upload else 'Verify'} workflow", icon=STEP)
+    emit(INFO, f"Latest run log: {log_path_for_sketch(sketch_file)}")
+    emit(OK, f"Sketch found: {sketch_file}")
     ensure_arduino_cli()
-    sketch_file = resolve_sketch(args.sketch)
+    emit_block("Sketch preparation", icon=STEP)
     project_config_path = locate_project_config(sketch_file.parent)
     args.project_dir = sketch_file.parent
     config = load_effective_config(project_config_path)
     sketch_dir, staged = prepare_sketch_dir(sketch_file)
+    emit_block("Target resolution", icon=STEP)
     port, port_label = infer_port(config, args, project_config_path, required=upload)
     fqbn, fqbn_label = infer_fqbn(config, args.fqbn, port, project_config_path, require_detected_for_port=upload)
     upload_speed = configured_upload_speed(config, args.upload_speed) if upload else None
+    emit_block("Safety checks", icon=SAFE)
     ensure_core_installed(fqbn)
     scan_risky_patterns(sketch_dir, fqbn, config, args.allow_risky_patterns)
     build_path = compute_build_path(sketch_file, fqbn)
@@ -933,16 +1023,20 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "verify":
-            emit(INFO, "Starting verify workflow...")
             ctx = build_context(args, upload=False)
             compile_sketch(ctx)
+            emit_block("Run completed", icon=DONE)
             emit(DONE, "Verify workflow finished successfully.")
+            if LOGGER:
+                emit(TIME, f"Total run time: {LOGGER.elapsed()}")
             return
         if args.command == "upload":
-            emit(INFO, "Starting upload workflow (includes verify)...")
             ctx = build_context(args, upload=True)
             compile_sketch(ctx)
             upload_sketch(ctx)
+            emit_block("Run completed", icon=DONE)
+            emit(DONE, "Upload workflow finished successfully.")
+            emit(TIME, f"Total run time: {LOGGER.elapsed()}")
             return
         if args.command == "port":
             if args.port_command == "list":
@@ -964,6 +1058,8 @@ def main() -> None:
         parser.error(f"Unknown command: {args.command}")
     except IotUtilsError as exc:
         fail(str(exc))
+    finally:
+        close_logger()
 
 
 if __name__ == "__main__":

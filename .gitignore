@@ -7,3 +7,4 @@ __pycache__/
 *.pyo
 .iot-utils.yml
 .iot-utils.yaml
+*.iot-utils.log

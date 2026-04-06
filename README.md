@@ -18,6 +18,7 @@ Support this project and related open learning/build tools: [Stripe support link
 
 - ✅ `verify` checks the sketch before upload
 - ✅ `upload` always includes verify first
+- ✅ each run writes a latest log file beside the target sketch
 - ✅ `port list` shows connected serial ports with board hints
 - ✅ YAML aliases let `esp32` mean `esp32:esp32:esp32wrover`
 - ✅ saved port aliases reduce repeated typing
@@ -140,6 +141,28 @@ At the start of `verify` and `upload`, `iot-utils` now shows the resolved:
 
 That makes it easier to confirm exactly what is about to happen before compile or upload begins.
 
+The terminal output is grouped into timestamped semantic sections such as:
+
+- verify workflow / upload workflow
+- sketch preparation
+- target resolution
+- safety checks
+- compile
+- upload
+- run completed
+
+At the end of the run, `iot-utils` also shows the total elapsed time.
+
+## Latest run log 📝
+
+Each `verify` or `upload` writes a latest-run log beside the sketch file:
+
+```bash
+path/to/Blink/Blink.iot-utils.log
+```
+
+Running again replaces that log so you always keep the latest result for that sketch.
+
 ## Port strategy 🔌
 
 Port selection priority:
@@ -151,6 +174,7 @@ Port selection priority:
 
 If a saved port disappears but one close match is found, `upload` can ask once before using and updating the saved default.
 If multiple ports exist but exactly one matches the selected/default board metadata, `iot-utils` now prefers that identified port automatically.
+If a safely selected port does not report board metadata, `iot-utils` can fall back to your configured `default_fqbn` so you do not need `--fqbn` every time.
 
 ## Defaults ⚙️
 
@@ -188,7 +212,7 @@ Fail-closed rules:
 
 - ❌ no usable serial port
 - ❌ multiple usable ports without explicit choice
-- ❌ selected upload port with unknown board type when `--fqbn` is not provided
+- ❌ selected upload port with unknown board type when neither `--fqbn` nor `default_fqbn` is available
 - ❌ compile failure
 - ❌ flash or RAM usage missing when enforcement is required
 - ❌ flash/RAM usage beyond configured limits
