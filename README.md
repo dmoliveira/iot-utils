@@ -28,11 +28,20 @@ Support this project and related open learning/build tools: [Stripe support link
 ## Quick Start ⏱️
 
 ```bash
-./iot-utils config init --global
-./iot-utils port list
-./iot-utils port set /dev/cu.usbserial-10 --alias esp32-main
-./iot-utils verify path/to/blink.ino --fqbn esp32
-./iot-utils upload path/to/blink.ino --fqbn esp32
+iot-utils --version
+iot-utils config init --global
+iot-utils port list
+iot-utils port set /dev/cu.usbserial-10 --alias esp32-main
+iot-utils verify path/to/blink.ino --fqbn esp32
+iot-utils upload path/to/blink.ino --fqbn esp32
+```
+
+## Install via Homebrew 🍺
+
+```bash
+brew tap dmoliveira/tap
+brew install iot-utils
+iot-utils --version
 ```
 
 ## Install from source 🧰
@@ -56,6 +65,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ### Sketch workflows
 
 ```bash
+iot-utils --version
 iot-utils verify path/to/sketch.ino --fqbn esp32
 iot-utils upload path/to/sketch.ino --fqbn esp32
 iot-utils verify path/to/sketch.ino --fqbn uno
@@ -187,22 +197,30 @@ Run tests with:
 ./scripts/test-all.sh
 ```
 
-## Homebrew / tap readiness 🍺
+## Homebrew / tap 🍺
 
-This repo now includes a formula template at:
+Published formula:
+
+```bash
+brew tap dmoliveira/tap
+brew install iot-utils
+```
+
+Formula source lives in your tap repo and this repo keeps a template at:
 
 ```bash
 packaging/homebrew/iot-utils.rb.template
 ```
 
-Recommended next release flow:
+Recommended next release update flow:
 
-1. commit and push this repo
-2. tag a release like `v0.1.0`
-3. update the formula URL + SHA256 to the tagged tarball
-4. copy or sync the formula into your `homebrew-tap` repo
+1. bump `VERSION` in `iot-utils`
+2. commit and push this repo
+3. tag a new release
+4. update the formula URL + SHA256 to the tagged tarball
+5. sync the formula into `homebrew-tap`
 
-After that, install can look like:
+Current install:
 
 ```bash
 brew tap dmoliveira/tap

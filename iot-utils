@@ -20,6 +20,7 @@ BUILD_ROOT = SCRIPT_ROOT / ".iot-utils-build"
 PROJECT_CONFIG_NAMES = (".iot-utils.yml", ".iot-utils.yaml")
 if os.environ.get("IOT_UTILS_CONFIG_DIR"):
     GLOBAL_CONFIG_PATH = Path(os.environ["IOT_UTILS_CONFIG_DIR"]).expanduser().resolve() / "config.yml"
+VERSION = "0.1.0"
 
 OK = "✅"
 FAIL = "❌"
@@ -816,6 +817,7 @@ def config_command_init(args: argparse.Namespace) -> None:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="iot-utils", description="Simple, safety-first Arduino/ESP32 verify and upload helper.", epilog="Examples: iot-utils verify blink.ino --fqbn esp32 | iot-utils port list | iot-utils config init --global")
+    parser.add_argument("--version", action="version", version=f"iot-utils {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common_arguments(subparser: argparse.ArgumentParser) -> None:
