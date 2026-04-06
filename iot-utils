@@ -22,7 +22,7 @@ BUILD_ROOT = SCRIPT_ROOT / ".iot-utils-build"
 PROJECT_CONFIG_NAMES = (".iot-utils.yml", ".iot-utils.yaml")
 if os.environ.get("IOT_UTILS_CONFIG_DIR"):
     GLOBAL_CONFIG_PATH = Path(os.environ["IOT_UTILS_CONFIG_DIR"]).expanduser().resolve() / "config.yml"
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 
 OK = "✅"
 FAIL = "❌"
@@ -351,6 +351,21 @@ def resolve_sketch(sketch_arg: str, *, announce: bool = True) -> Path:
     if announce:
         emit(OK, f"Sketch found: {sketch}")
     return sketch
+
+
+def discover_latest_sketch(search_dir: Path) -> Path:
+    candidates = sorted(
+        (path for path in search_dir.iterdir() if path.is_file() and path.suffix.lower() == ".ino"),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    if not candidates:
+        raise IotUtilsError(
+            f"No .ino sketch file was provided and none were found in the current directory: {search_dir}"
+        )
+    chosen = candidates[0].resolve()
+    emit(OK, f"No sketch path provided; using latest .ino in current directory: {chosen.name}")
+    return chosen
 
 
 def log_path_for_sketch(sketch_file: Path) -> Path:
@@ -826,7 +841,7 @@ def show_resolved_parameters(command_name: str, ctx: SketchContext) -> None:
 
 
 def build_context(args: argparse.Namespace, *, upload: bool) -> SketchContext:
-    sketch_file = resolve_sketch(args.sketch, announce=False)
+    sketch_file = resolve_sketch(args.sketch, announce=False) if args.sketch else discover_latest_sketch(Path.cwd())
     set_logger(log_path_for_sketch(sketch_file))
     emit_block(f"{'Upload' if upload else 'Verify'} workflow", icon=STEP)
     emit(INFO, f"Latest run log: {log_path_for_sketch(sketch_file)}")
@@ -972,12 +987,12 @@ def config_command_init(args: argparse.Namespace) -> None:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="iot-utils", description="Simple, safety-first Arduino/ESP32 verify and upload helper.", epilog="Examples: iot-utils verify blink.ino --fqbn esp32 | iot-utils port list | iot-utils config init --global")
+    parser = argparse.ArgumentParser(prog="iot-utils", description="Simple, safety-first Arduino/ESP32 verify and upload helper.", epilog="Examples: iot-utils verify --fqbn esp32 | iot-utils upload blink.ino --fqbn esp32 | iot-utils port list | iot-utils config init --global")
     parser.add_argument("--version", action="version", version=f"iot-utils {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common_arguments(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument("sketch", help="Path to a .ino sketch file")
+        subparser.add_argument("sketch", nargs="?", help="Path to a .ino sketch file; if omitted, uses the latest .ino in the current directory")
         subparser.add_argument("--fqbn", help="Board FQBN or alias, for example esp32 or esp32:esp32:esp32wrover")
         subparser.add_argument("--port", help="Serial port or saved alias, for example /dev/cu.usbserial-10 or esp32-main")
         subparser.add_argument("--upload-speed", type=int, help="Upload speed in baud, defaulting to config or 115200")

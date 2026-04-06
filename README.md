@@ -18,6 +18,7 @@ Support this project and related open learning/build tools: [Stripe support link
 
 - ✅ `verify` checks the sketch before upload
 - ✅ `upload` always includes verify first
+- ✅ if no sketch is passed, it uses the latest changed `.ino` in the current working directory
 - ✅ each run writes a latest log file beside the target sketch
 - ✅ `port list` shows connected serial ports with board hints
 - ✅ YAML aliases let `esp32` mean `esp32:esp32:esp32wrover`
@@ -33,6 +34,8 @@ iot-utils --version
 iot-utils config init --global
 iot-utils port list
 iot-utils port set /dev/cu.usbserial-10 --alias esp32-main
+iot-utils verify --fqbn esp32
+iot-utils upload --fqbn esp32
 iot-utils upload path/to/blink.ino --fqbn esp32 --upload-speed 115200
 iot-utils verify path/to/blink.ino --fqbn esp32
 iot-utils upload path/to/blink.ino --fqbn esp32
@@ -68,11 +71,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```bash
 iot-utils --version
+iot-utils verify --fqbn esp32
+iot-utils upload --fqbn esp32
 iot-utils verify path/to/sketch.ino --fqbn esp32
 iot-utils upload path/to/sketch.ino --fqbn esp32
 iot-utils upload path/to/sketch.ino --fqbn esp32 --upload-speed 115200
 iot-utils verify path/to/sketch.ino --fqbn uno
 ```
+
+If you omit the sketch path, `iot-utils` scans the top-level `.ino` files in the current working directory and picks the most recently modified one.
 
 ### Port management
 
