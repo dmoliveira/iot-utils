@@ -32,6 +32,7 @@ iot-utils --version
 iot-utils config init --global
 iot-utils port list
 iot-utils port set /dev/cu.usbserial-10 --alias esp32-main
+iot-utils upload path/to/blink.ino --fqbn esp32 --upload-speed 115200
 iot-utils verify path/to/blink.ino --fqbn esp32
 iot-utils upload path/to/blink.ino --fqbn esp32
 ```
@@ -68,6 +69,7 @@ export PATH="$HOME/.local/bin:$PATH"
 iot-utils --version
 iot-utils verify path/to/sketch.ino --fqbn esp32
 iot-utils upload path/to/sketch.ino --fqbn esp32
+iot-utils upload path/to/sketch.ino --fqbn esp32 --upload-speed 115200
 iot-utils verify path/to/sketch.ino --fqbn uno
 ```
 
@@ -105,6 +107,7 @@ Example:
 
 ```yaml
 default_fqbn: esp32
+default_upload_speed: 115200
 default_port: /dev/cu.usbserial-10
 fqbn_aliases:
   esp32: esp32:esp32:esp32wrover
@@ -120,6 +123,7 @@ This means you can run:
 ```bash
 iot-utils upload blink.ino --fqbn esp32
 iot-utils upload blink.ino --port esp32-main --fqbn esp32
+iot-utils upload blink.ino --fqbn esp32 --upload-speed 115200
 ```
 
 ## Parameter summary on start 🧭
@@ -130,6 +134,7 @@ At the start of `verify` and `upload`, `iot-utils` now shows the resolved:
 - sketch directory
 - FQBN and alias/input used
 - port and alias/input used
+- upload speed
 - build path
 - project/global config paths
 
@@ -145,6 +150,7 @@ Port selection priority:
 4. auto-detected single usable port
 
 If a saved port disappears but one close match is found, `upload` can ask once before using and updating the saved default.
+If multiple ports exist but exactly one matches the selected/default board metadata, `iot-utils` now prefers that identified port automatically.
 
 ## Defaults ⚙️
 
@@ -155,6 +161,7 @@ Tracked repo defaults live in `iot-utils.json`:
 - `uno` → `arduino:avr:uno`
 - `nano` → `arduino:avr:nano`
 - `mega` → `arduino:avr:mega`
+- default upload speed: `115200`
 - max flash usage: `95%`
 - max RAM usage: `85%`
 - fail closed if flash or RAM percentages are unavailable

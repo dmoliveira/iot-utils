@@ -20,7 +20,7 @@ BUILD_ROOT = SCRIPT_ROOT / ".iot-utils-build"
 PROJECT_CONFIG_NAMES = (".iot-utils.yml", ".iot-utils.yaml")
 if os.environ.get("IOT_UTILS_CONFIG_DIR"):
     GLOBAL_CONFIG_PATH = Path(os.environ["IOT_UTILS_CONFIG_DIR"]).expanduser().resolve() / "config.yml"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 OK = "✅"
 FAIL = "❌"
@@ -48,6 +48,7 @@ class SketchContext:
     fqbn_label: str
     port: str | None
     port_label: str
+    upload_speed: int | None
     config: dict[str, Any]
     project_config_path: Path | None
 
@@ -364,6 +365,31 @@ def resolve_fqbn_reference(value: str | None, config: dict[str, Any]) -> tuple[s
     return value, value
 
 
+def configured_upload_speed(config: dict[str, Any], override: int | None) -> int:
+    if override is not None:
+        if override <= 0:
+            raise IotUtilsError("Upload speed must be a positive integer baud rate.")
+        return override
+    try:
+        configured = int(config.get("default_upload_speed", 115200))
+    except (TypeError, ValueError) as exc:
+        raise IotUtilsError("default_upload_speed in config must be a positive integer baud rate.") from exc
+    if configured <= 0:
+        raise IotUtilsError("default_upload_speed in config must be a positive integer baud rate.")
+    return configured
+
+
+def preferred_fqbn_for_port_selection(config: dict[str, Any], requested_fqbn: str | None) -> str | None:
+    if requested_fqbn:
+        resolved, _ = resolve_fqbn_reference(requested_fqbn, config)
+        return resolved
+    default_fqbn = config.get("default_fqbn")
+    if default_fqbn:
+        resolved, _ = resolve_fqbn_reference(str(default_fqbn), config)
+        return resolved
+    return None
+
+
 def resolve_port_reference(value: str, config: dict[str, Any]) -> tuple[str, str]:
     aliases = port_aliases(config)
     if value in aliases:
@@ -445,6 +471,29 @@ def find_close_port(saved_port: str, candidates: list[dict[str, Any]]) -> dict[s
     return None
 
 
+def candidate_matches_fqbn(candidate: dict[str, Any], fqbn: str) -> bool:
+    for board in candidate.get("matching_boards", []):
+        if board.get("fqbn") == fqbn:
+            return True
+    return False
+
+
+def choose_detected_port_candidate(candidates: list[dict[str, Any]], preferred_fqbn: str | None) -> dict[str, Any] | None:
+    if len(candidates) == 1:
+        return candidates[0]
+    if preferred_fqbn:
+        exact_matches = [candidate for candidate in candidates if candidate_matches_fqbn(candidate, preferred_fqbn)]
+        if len(exact_matches) == 1:
+            emit(OK, f"Selected the only port matching board {preferred_fqbn}: {exact_matches[0]['address']}")
+            return exact_matches[0]
+        return None
+    identified = [candidate for candidate in candidates if candidate.get("matching_boards")]
+    if len(identified) == 1:
+        emit(OK, f"Selected the only board-identified serial port: {identified[0]['address']}")
+        return identified[0]
+    return None
+
+
 def confirm(prompt: str, *, assume_yes: bool, no_input: bool) -> bool:
     if assume_yes:
         emit(WARN, f"Auto-confirmed: {prompt}")
@@ -455,8 +504,8 @@ def confirm(prompt: str, *, assume_yes: bool, no_input: bool) -> bool:
     return response in {"y", "yes"}
 
 
-def persist_default_port(port_value: str, scope: str, base_dir: Path) -> None:
-    config_path = default_project_config_path(base_dir) if scope == "project" else GLOBAL_CONFIG_PATH
+def persist_default_port(port_value: str, scope: str, project_path: Path | None, base_dir: Path) -> None:
+    config_path = project_path if scope == "project" and project_path else default_project_config_path(base_dir) if scope == "project" else GLOBAL_CONFIG_PATH
     config = read_yaml_file(config_path)
     config["default_port"] = port_value
     persist_yaml_config(config_path, config)
@@ -465,6 +514,7 @@ def persist_default_port(port_value: str, scope: str, base_dir: Path) -> None:
 
 def choose_port_for_upload(config: dict[str, Any], args: argparse.Namespace, project_path: Path | None) -> tuple[str, str]:
     candidates = usable_serial_ports(config, project_path)
+    preferred_fqbn = preferred_fqbn_for_port_selection(config, args.fqbn)
     if args.port:
         requested, label = resolve_port_reference(args.port, config)
         match = find_port_by_address(candidates, requested)
@@ -483,15 +533,16 @@ def choose_port_for_upload(config: dict[str, Any], args: argparse.Namespace, pro
         if close_match:
             prompt = f"Saved {saved_source} port {saved_port} is unavailable. Use close match {close_match['address']} instead and update the saved default?"
             if confirm(prompt, assume_yes=args.yes, no_input=args.no_input):
-                persist_default_port(close_match["address"], saved_source or "global", args.project_dir)
+                persist_default_port(close_match["address"], saved_source or "global", project_path, args.project_dir)
                 return close_match["address"], close_match["address"]
             raise IotUtilsError(f"Saved {saved_source} default port {saved_port} is unavailable. Run 'iot-utils port list' or pass --port explicitly.")
         available_ports = ", ".join(candidate["address"] for candidate in candidates) or "none"
         raise IotUtilsError(f"Saved {saved_source} default port {saved_port} is unavailable. Available ports: {available_ports}.")
 
-    if len(candidates) == 1:
-        emit(OK, f"Auto-detected upload port: {candidates[0]['address']}")
-        return candidates[0]["address"], candidates[0]["address"]
+    auto_choice = choose_detected_port_candidate(candidates, preferred_fqbn)
+    if auto_choice:
+        emit(OK, f"Auto-detected upload port: {auto_choice['address']}")
+        return auto_choice["address"], auto_choice["address"]
     if not candidates:
         raise IotUtilsError("No usable serial ports detected. Connect the board or pass --port explicitly.")
     ports = ", ".join(candidate["address"] for candidate in candidates)
@@ -654,8 +705,20 @@ def compile_sketch(ctx: SketchContext) -> None:
 def upload_sketch(ctx: SketchContext) -> None:
     if not ctx.port:
         raise IotUtilsError("Upload requested without a selected serial port.")
-    emit(RUN, f"Uploading sketch to {ctx.port}...")
-    command = ["arduino-cli", "upload", "--fqbn", ctx.fqbn, "--input-dir", str(ctx.build_path), "--port", ctx.port, str(ctx.sketch_dir)]
+    emit(RUN, f"Uploading sketch to {ctx.port} at {ctx.upload_speed} baud...")
+    command = [
+        "arduino-cli",
+        "upload",
+        "--fqbn",
+        ctx.fqbn,
+        "--input-dir",
+        str(ctx.build_path),
+        "--port",
+        ctx.port,
+        "--upload-property",
+        f"upload.speed={ctx.upload_speed}",
+        str(ctx.sketch_dir),
+    ]
     result = run_command(command, check=False)
     combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
     if result.returncode != 0:
@@ -673,6 +736,7 @@ def show_resolved_parameters(command_name: str, ctx: SketchContext) -> None:
     emit(INFO, f"Sketch dir: {ctx.sketch_dir}")
     emit(INFO, f"FQBN: {ctx.fqbn} (input: {ctx.fqbn_label})")
     emit(INFO, f"Port: {ctx.port or 'not required'}{'' if not ctx.port_label else f' (input: {ctx.port_label})'}")
+    emit(INFO, f"Upload speed: {ctx.upload_speed if ctx.upload_speed is not None else 'not applicable'}")
     emit(INFO, f"Build path: {ctx.build_path}")
     emit(INFO, f"Project config: {ctx.project_config_path or 'not set'}")
     emit(INFO, f"Global config: {GLOBAL_CONFIG_PATH if GLOBAL_CONFIG_PATH.exists() else 'not set'}")
@@ -687,11 +751,12 @@ def build_context(args: argparse.Namespace, *, upload: bool) -> SketchContext:
     sketch_dir, staged = prepare_sketch_dir(sketch_file)
     port, port_label = infer_port(config, args, project_config_path, required=upload)
     fqbn, fqbn_label = infer_fqbn(config, args.fqbn, port, project_config_path, require_detected_for_port=upload)
+    upload_speed = configured_upload_speed(config, args.upload_speed) if upload else None
     ensure_core_installed(fqbn)
     scan_risky_patterns(sketch_dir, fqbn, config, args.allow_risky_patterns)
     build_path = compute_build_path(sketch_file, fqbn)
     emit(OK, f"Build artifact directory: {build_path}")
-    ctx = SketchContext(sketch_file=sketch_file, sketch_dir=sketch_dir, build_path=build_path, staged=staged, fqbn=fqbn, fqbn_label=fqbn_label, port=port, port_label=port_label or "", config=config, project_config_path=project_config_path)
+    ctx = SketchContext(sketch_file=sketch_file, sketch_dir=sketch_dir, build_path=build_path, staged=staged, fqbn=fqbn, fqbn_label=fqbn_label, port=port, port_label=port_label or "", upload_speed=upload_speed, config=config, project_config_path=project_config_path)
     show_resolved_parameters(args.command, ctx)
     return ctx
 
@@ -808,6 +873,7 @@ def config_command_init(args: argparse.Namespace) -> None:
         raise IotUtilsError(f"Config file already exists: {target_path}. Use --force to overwrite.")
     initial = {
         "default_fqbn": "esp32",
+        "default_upload_speed": 115200,
         "fqbn_aliases": {"esp32": "esp32:esp32:esp32wrover", "uno": "arduino:avr:uno", "nano": "arduino:avr:nano", "mega": "arduino:avr:mega"},
         "port_aliases": {},
     }
@@ -824,6 +890,7 @@ def make_parser() -> argparse.ArgumentParser:
         subparser.add_argument("sketch", help="Path to a .ino sketch file")
         subparser.add_argument("--fqbn", help="Board FQBN or alias, for example esp32 or esp32:esp32:esp32wrover")
         subparser.add_argument("--port", help="Serial port or saved alias, for example /dev/cu.usbserial-10 or esp32-main")
+        subparser.add_argument("--upload-speed", type=int, help="Upload speed in baud, defaulting to config or 115200")
         subparser.add_argument("--yes", action="store_true", help="Auto-confirm safe replacement prompts when possible")
         subparser.add_argument("--no-input", action="store_true", help="Fail instead of prompting for confirmation")
         subparser.add_argument("--allow-risky-patterns", action="store_true", help="Continue even if blocking risky code patterns are detected")
