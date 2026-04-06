@@ -1,0 +1,9 @@
+.iot-utils-build/
+__pycache__/
+.iot-utils.local.json
+.tmp-home/
+.DS_Store
+*.pyc
+*.pyo
+.iot-utils.yml
+.iot-utils.yaml

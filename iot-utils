@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = SCRIPT_ROOT / "iot-utils.json"
+GLOBAL_CONFIG_PATH = Path.home() / ".config" / "iot-utils" / "config.yml"
+BUILD_ROOT = SCRIPT_ROOT / ".iot-utils-build"
+PROJECT_CONFIG_NAMES = (".iot-utils.yml", ".iot-utils.yaml")
+if os.environ.get("IOT_UTILS_CONFIG_DIR"):
+    GLOBAL_CONFIG_PATH = Path(os.environ["IOT_UTILS_CONFIG_DIR"]).expanduser().resolve() / "config.yml"
+
+OK = "✅"
+FAIL = "❌"
+WARN = "⚠️"
+INFO = "🔎"
+RUN = "🚀"
+SAFE = "🛡️"
+PORT = "🔌"
+SAVE = "💾"
+CFG = "🧾"
+DONE = "🎉"
+
+
+class IotUtilsError(RuntimeError):
+    pass
+
+
+@dataclass
+class SketchContext:
+    sketch_file: Path
+    sketch_dir: Path
+    build_path: Path
+    staged: bool
+    fqbn: str
+    fqbn_label: str
+    port: str | None
+    port_label: str
+    config: dict[str, Any]
+    project_config_path: Path | None
+
+
+def emit(icon: str, message: str) -> None:
+    print(f"{icon} {message}")
+
+
+def fail(message: str, code: int = 1) -> None:
+    emit(FAIL, message)
+    raise SystemExit(code)
+
+
+def run_command(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(command, text=True, capture_output=True)
+    if check and result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise IotUtilsError(details or f"Command failed: {' '.join(command)}")
+    return result
+
+
+def parse_scalar(value: str) -> Any:
+    stripped = value.strip()
+    if stripped in {"true", "True"}:
+        return True
+    if stripped in {"false", "False"}:
+        return False
+    if stripped in {"null", "None", "~"}:
+        return None
+    if re.fullmatch(r"-?\d+", stripped):
+        return int(stripped)
+    if re.fullmatch(r"-?\d+\.\d+", stripped):
+        return float(stripped)
+    if (stripped.startswith('"') and stripped.endswith('"')) or (stripped.startswith("'") and stripped.endswith("'")):
+        return stripped[1:-1]
+    return stripped
+
+
+def parse_simple_yaml(text: str) -> dict[str, Any]:
+    entries: list[tuple[int, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        entries.append((indent, line.strip()))
+
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, Any]] = [(-1, root)]
+
+    for index, (indent, stripped) in enumerate(entries):
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+
+        if stripped.startswith("- "):
+            if not isinstance(parent, list):
+                raise IotUtilsError("Unsupported YAML structure in config file.")
+            parent.append(parse_scalar(stripped[2:]))
+            continue
+
+        if ":" not in stripped:
+            raise IotUtilsError("Unsupported YAML line in config file.")
+
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not isinstance(parent, dict):
+            raise IotUtilsError("Unsupported YAML nesting in config file.")
+
+        if value:
+            parent[key] = parse_scalar(value)
+            continue
+
+        next_container: Any = {}
+        for future_indent, future_line in entries[index + 1 :]:
+            if future_indent <= indent:
+                break
+            if future_indent > indent:
+                next_container = [] if future_line.startswith("- ") else {}
+                break
+        parent[key] = next_container
+        stack.append((indent, next_container))
+
+    return coerce_yaml_collections(root)
+
+
+def coerce_yaml_collections(value: Any) -> Any:
+    if isinstance(value, dict):
+        converted = {k: coerce_yaml_collections(v) for k, v in value.items()}
+        for key, child in list(converted.items()):
+            if child == {}:
+                converted[key] = {}
+        return converted
+    if isinstance(value, list):
+        return [coerce_yaml_collections(item) for item in value]
+    return value
+
+
+def serialize_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if re.search(r"[:#\-]|^\s|\s$", text):
+        return json.dumps(text)
+    return text
+
+
+def dump_simple_yaml(data: dict[str, Any], indent: int = 0) -> str:
+    lines: list[str] = []
+    prefix = " " * indent
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.append(dump_simple_yaml(value, indent + 2))
+        elif isinstance(value, list):
+            lines.append(f"{prefix}{key}:")
+            for item in value:
+                lines.append(f"{' ' * (indent + 2)}- {serialize_scalar(item)}")
+        else:
+            lines.append(f"{prefix}{key}: {serialize_scalar(value)}")
+    return "\n".join(lines)
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def read_yaml_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return parse_simple_yaml(path.read_text())
+
+
+def write_yaml_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_simple_yaml(data).strip() + "\n")
+
+
+def normalize_saved_config(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    if normalized.get("port_aliases") == {}:
+        normalized.pop("port_aliases")
+    if normalized.get("fqbn_aliases") == {}:
+        normalized.pop("fqbn_aliases")
+    return normalized
+
+
+def persist_yaml_config(path: Path, data: dict[str, Any]) -> None:
+    normalized = normalize_saved_config(data)
+    if normalized:
+        write_yaml_file(path, normalized)
+    elif path.exists():
+        path.unlink()
+
+
+def merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def locate_project_config(start: Path) -> Path | None:
+    current = start.resolve()
+    while True:
+        for name in PROJECT_CONFIG_NAMES:
+            candidate = current / name
+            if candidate.exists():
+                return candidate
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def default_project_config_path(base_dir: Path) -> Path:
+    return base_dir.resolve() / PROJECT_CONFIG_NAMES[0]
+
+
+def load_default_config() -> dict[str, Any]:
+    return read_json_file(DEFAULT_CONFIG_PATH)
+
+
+def load_global_config() -> dict[str, Any]:
+    return read_yaml_file(GLOBAL_CONFIG_PATH)
+
+
+def load_project_config(project_path: Path | None) -> dict[str, Any]:
+    if not project_path:
+        return {}
+    return read_yaml_file(project_path)
+
+
+def load_effective_config(project_path: Path | None) -> dict[str, Any]:
+    config = load_default_config()
+    config = merge_dicts(config, load_global_config())
+    config = merge_dicts(config, load_project_config(project_path))
+    return config
+
+
+def ensure_arduino_cli() -> None:
+    path = shutil.which("arduino-cli")
+    if not path:
+        raise IotUtilsError("arduino-cli is not installed or not on PATH.")
+    version = run_command(["arduino-cli", "version"]).stdout.strip()
+    emit(OK, f"arduino-cli found: {version}")
+
+
+def resolve_sketch(sketch_arg: str) -> Path:
+    sketch = Path(sketch_arg).expanduser().resolve()
+    if not sketch.exists():
+        raise IotUtilsError(f"Sketch not found: {sketch}")
+    if sketch.suffix.lower() != ".ino":
+        raise IotUtilsError(f"Expected a .ino sketch file, got: {sketch.name}")
+    emit(OK, f"Sketch found: {sketch}")
+    return sketch
+
+
+def prepare_sketch_dir(sketch_file: Path) -> tuple[Path, bool]:
+    if sketch_file.parent.name == sketch_file.stem:
+        emit(OK, f"Sketch folder already matches Arduino naming rules: {sketch_file.parent}")
+        return sketch_file.parent, False
+
+    digest = hashlib.sha1(str(sketch_file).encode("utf-8")).hexdigest()[:10]
+    staged_dir = BUILD_ROOT / "staged-sketches" / f"{sketch_file.stem}-{digest}" / sketch_file.stem
+    if staged_dir.parent.exists():
+        shutil.rmtree(staged_dir.parent)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+
+    ignored_names = {".git", ".iot-utils-build", "__pycache__", ".DS_Store", "build", "dist"}
+    ignored_suffixes = {".bin", ".elf", ".hex", ".map", ".o", ".pyc"}
+    support_root_suffixes = {".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx", ".S", ".tpp", ".ipp", ".txt", ".md", ".json", ".yml", ".yaml"}
+    support_directories = {"src", "data", "lib", "include"}
+    skipped_ino_files: list[str] = []
+
+    for item in sketch_file.parent.iterdir():
+        if item.name in ignored_names or item.suffix.lower() in ignored_suffixes:
+            continue
+        if item == sketch_file:
+            shutil.copy2(item, staged_dir / f"{sketch_file.stem}.ino")
+        elif item.is_dir() and item.name in support_directories:
+            shutil.copytree(item, staged_dir / item.name, dirs_exist_ok=True)
+        elif item.suffix.lower() == ".ino":
+            skipped_ino_files.append(item.name)
+        elif item.suffix.lower() in support_root_suffixes:
+            shutil.copy2(item, staged_dir / item.name)
+
+    if skipped_ino_files:
+        emit(WARN, f"Skipped sibling sketch files during staging: {', '.join(sorted(skipped_ino_files))}")
+
+    emit(OK, f"Prepared Arduino-compatible sketch folder: {staged_dir}")
+    return staged_dir, True
+
+
+def list_source_files(sketch_dir: Path) -> list[Path]:
+    exts = {".ino", ".h", ".hpp", ".c", ".cc", ".cpp"}
+    return sorted(path for path in sketch_dir.rglob("*") if path.is_file() and path.suffix.lower() in exts)
+
+
+def board_list() -> list[dict[str, Any]]:
+    result = run_command(["arduino-cli", "board", "list", "--format", "json"])
+    data = json.loads(result.stdout or "{}")
+    return data.get("detected_ports", [])
+
+
+def core_list() -> set[str]:
+    result = run_command(["arduino-cli", "core", "list", "--format", "json"])
+    data = json.loads(result.stdout or "{}")
+    return {platform.get("id") for platform in data.get("platforms", []) if platform.get("id")}
+
+
+def ignored_port_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern, re.IGNORECASE) for pattern in config.get("ignored_port_patterns", [])]
+
+
+def detect_port_kind(address: str, label: str) -> str:
+    text = f"{address} {label}".lower()
+    if "bluetooth" in text:
+        return "Bluetooth"
+    if "usb" in text or "usbmodem" in text or "usbserial" in text:
+        return "USB serial"
+    if "tty" in text or "serial" in text:
+        return "Serial"
+    return "Unknown"
+
+
+def fqbn_aliases(config: dict[str, Any]) -> dict[str, str]:
+    aliases = config.get("fqbn_aliases", {})
+    return aliases if isinstance(aliases, dict) else {}
+
+
+def port_aliases(config: dict[str, Any]) -> dict[str, str]:
+    aliases = config.get("port_aliases", {})
+    return aliases if isinstance(aliases, dict) else {}
+
+
+def resolve_fqbn_reference(value: str | None, config: dict[str, Any]) -> tuple[str | None, str | None]:
+    if not value:
+        return None, None
+    aliases = fqbn_aliases(config)
+    if value in aliases:
+        resolved = aliases[value]
+        emit(OK, f"Resolved FQBN alias '{value}' -> {resolved}")
+        return resolved, value
+    return value, value
+
+
+def resolve_port_reference(value: str, config: dict[str, Any]) -> tuple[str, str]:
+    aliases = port_aliases(config)
+    if value in aliases:
+        resolved = aliases[value]
+        emit(OK, f"Resolved port alias '{value}' -> {resolved}")
+        return resolved, value
+    return value, value
+
+
+def get_saved_default_port(project_path: Path | None) -> tuple[str | None, str | None]:
+    if project_path:
+        project = load_project_config(project_path).get("default_port")
+        if project:
+            return str(project), "project"
+    global_port = load_global_config().get("default_port")
+    if global_port:
+        return str(global_port), "global"
+    return None, None
+
+
+def all_serial_ports(config: dict[str, Any], project_path: Path | None) -> list[dict[str, Any]]:
+    ignored = ignored_port_patterns(config)
+    aliases = port_aliases(config)
+    default_port, default_source = get_saved_default_port(project_path)
+    ports: list[dict[str, Any]] = []
+    for entry in board_list():
+        port = entry.get("port", {})
+        address = port.get("address", "")
+        label = port.get("label", address)
+        protocol = port.get("protocol", "")
+        if protocol and protocol != "serial":
+            continue
+        ignored_match = any(pattern.search(address) or pattern.search(label) for pattern in ignored)
+        matching_boards = entry.get("matching_boards", [])
+        ports.append(
+            {
+                "address": address,
+                "label": label,
+                "protocol": protocol or "serial",
+                "kind": detect_port_kind(address, label),
+                "ignored": ignored_match,
+                "aliases": sorted(alias for alias, value in aliases.items() if value == address),
+                "matching_boards": matching_boards,
+                "is_default": address == default_port,
+                "default_source": default_source if address == default_port else None,
+            }
+        )
+    return ports
+
+
+def usable_serial_ports(config: dict[str, Any], project_path: Path | None) -> list[dict[str, Any]]:
+    return [port for port in all_serial_ports(config, project_path) if not port["ignored"]]
+
+
+def describe_port(port: dict[str, Any]) -> str:
+    board_names = ", ".join(board.get("name", "unknown") for board in port.get("matching_boards", []) if board.get("name")) or "unknown board"
+    alias_text = f" | aliases: {', '.join(port['aliases'])}" if port.get("aliases") else ""
+    default_text = f" | default: {port['default_source']}" if port.get("is_default") else ""
+    ignored_text = " | ignored by safety filter" if port.get("ignored") else ""
+    return f"{port['address']} ({port['kind']}) | {board_names}{alias_text}{default_text}{ignored_text}"
+
+
+def find_port_by_address(candidates: list[dict[str, Any]], address: str) -> dict[str, Any] | None:
+    for candidate in candidates:
+        if candidate["address"] == address:
+            return candidate
+    return None
+
+
+def normalize_port_family(port_value: str) -> str:
+    return re.sub(r"\d+$", "", Path(port_value).name.lower())
+
+
+def find_close_port(saved_port: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    saved_family = normalize_port_family(saved_port)
+    matches = [candidate for candidate in candidates if normalize_port_family(candidate["address"]) == saved_family]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def confirm(prompt: str, *, assume_yes: bool, no_input: bool) -> bool:
+    if assume_yes:
+        emit(WARN, f"Auto-confirmed: {prompt}")
+        return True
+    if no_input or not sys.stdin.isatty():
+        return False
+    response = input(f"{prompt} [y/N]: ").strip().lower()
+    return response in {"y", "yes"}
+
+
+def persist_default_port(port_value: str, scope: str, base_dir: Path) -> None:
+    config_path = default_project_config_path(base_dir) if scope == "project" else GLOBAL_CONFIG_PATH
+    config = read_yaml_file(config_path)
+    config["default_port"] = port_value
+    persist_yaml_config(config_path, config)
+    emit(SAVE, f"Saved {scope} default port: {port_value}")
+
+
+def choose_port_for_upload(config: dict[str, Any], args: argparse.Namespace, project_path: Path | None) -> tuple[str, str]:
+    candidates = usable_serial_ports(config, project_path)
+    if args.port:
+        requested, label = resolve_port_reference(args.port, config)
+        match = find_port_by_address(candidates, requested)
+        if match:
+            emit(OK, f"Using requested port: {requested}")
+            return requested, label
+        raise IotUtilsError(f"Requested port not found among supported serial ports: {requested}")
+
+    saved_port, saved_source = get_saved_default_port(project_path)
+    if saved_port:
+        match = find_port_by_address(candidates, saved_port)
+        if match:
+            emit(OK, f"Using saved {saved_source} default port: {saved_port}")
+            return saved_port, saved_port
+        close_match = find_close_port(saved_port, candidates)
+        if close_match:
+            prompt = f"Saved {saved_source} port {saved_port} is unavailable. Use close match {close_match['address']} instead and update the saved default?"
+            if confirm(prompt, assume_yes=args.yes, no_input=args.no_input):
+                persist_default_port(close_match["address"], saved_source or "global", args.project_dir)
+                return close_match["address"], close_match["address"]
+            raise IotUtilsError(f"Saved {saved_source} default port {saved_port} is unavailable. Run 'iot-utils port list' or pass --port explicitly.")
+        available_ports = ", ".join(candidate["address"] for candidate in candidates) or "none"
+        raise IotUtilsError(f"Saved {saved_source} default port {saved_port} is unavailable. Available ports: {available_ports}.")
+
+    if len(candidates) == 1:
+        emit(OK, f"Auto-detected upload port: {candidates[0]['address']}")
+        return candidates[0]["address"], candidates[0]["address"]
+    if not candidates:
+        raise IotUtilsError("No usable serial ports detected. Connect the board or pass --port explicitly.")
+    ports = ", ".join(candidate["address"] for candidate in candidates)
+    raise IotUtilsError(f"Multiple serial ports detected ({ports}). Run 'iot-utils port set <port>' for a default or pass --port explicitly.")
+
+
+def infer_port(config: dict[str, Any], args: argparse.Namespace, project_path: Path | None, *, required: bool) -> tuple[str | None, str | None]:
+    if required:
+        return choose_port_for_upload(config, args, project_path)
+    candidates = usable_serial_ports(config, project_path)
+    if args.port:
+        requested, label = resolve_port_reference(args.port, config)
+        match = find_port_by_address(candidates, requested)
+        if match:
+            emit(OK, f"Using requested port: {requested}")
+            return requested, label
+        raise IotUtilsError(f"Requested port not found among supported serial ports: {requested}")
+    saved_port, saved_source = get_saved_default_port(project_path)
+    if saved_port:
+        emit(INFO, f"Saved {saved_source} default port available for uploads: {saved_port}")
+        return None, None
+    if candidates:
+        emit(INFO, f"Detected serial ports: {', '.join(candidate['address'] for candidate in candidates)}")
+    else:
+        emit(INFO, "No upload port required for verify-only mode.")
+    return None, None
+
+
+def infer_fqbn(config: dict[str, Any], requested_fqbn: str | None, selected_port: str | None, project_path: Path | None, *, require_detected_for_port: bool) -> tuple[str, str]:
+    if requested_fqbn:
+        resolved, label = resolve_fqbn_reference(requested_fqbn, config)
+        emit(OK, f"Using requested FQBN: {resolved}")
+        return resolved or requested_fqbn, label or requested_fqbn
+
+    candidates = usable_serial_ports(config, project_path)
+    matching_boards: list[dict[str, str]] = []
+    for entry in candidates:
+        if selected_port and entry["address"] != selected_port:
+            continue
+        for board in entry.get("matching_boards", []):
+            fqbn = board.get("fqbn")
+            if fqbn:
+                matching_boards.append(board)
+
+    unique_fqbns = sorted({board["fqbn"] for board in matching_boards if board.get("fqbn")})
+    if len(unique_fqbns) == 1:
+        emit(OK, f"Auto-detected FQBN: {unique_fqbns[0]}")
+        return unique_fqbns[0], unique_fqbns[0]
+
+    if selected_port and require_detected_for_port:
+        if len(unique_fqbns) > 1:
+            raise IotUtilsError(f"Selected port matches multiple board types ({', '.join(unique_fqbns)}). Pass --fqbn explicitly.")
+        raise IotUtilsError("Selected upload port did not report a unique board type. Pass --fqbn explicitly to avoid uploading to the wrong target.")
+
+    default_fqbn = config.get("default_fqbn")
+    resolved_default, label = resolve_fqbn_reference(str(default_fqbn), config) if default_fqbn else (None, None)
+    if resolved_default:
+        emit(WARN, f"FQBN auto-detect was not conclusive; falling back to config default: {resolved_default}")
+        return resolved_default, label or resolved_default
+
+    if len(unique_fqbns) > 1:
+        raise IotUtilsError(f"Multiple board types detected ({', '.join(unique_fqbns)}). Pass --fqbn explicitly.")
+    raise IotUtilsError("Unable to detect board type. Pass --fqbn explicitly or set default_fqbn in config.")
+
+
+def ensure_core_installed(fqbn: str) -> None:
+    core_id = ":".join(fqbn.split(":")[:2])
+    installed = core_list()
+    if core_id not in installed:
+        raise IotUtilsError(f"Required board core is not installed: {core_id}")
+    emit(OK, f"Board core installed: {core_id}")
+
+
+def pattern_applies(rule: dict[str, Any], fqbn: str) -> bool:
+    boards = rule.get("boards")
+    if not boards:
+        return True
+    return any(fqbn.startswith(prefix) for prefix in boards)
+
+
+def scan_risky_patterns(sketch_dir: Path, fqbn: str, config: dict[str, Any], allow_risky: bool) -> None:
+    emit(SAFE, "Running risky-pattern safety scan...")
+    findings: list[tuple[str, str, str, str, str]] = []
+    for source_file in list_source_files(sketch_dir):
+        content = source_file.read_text(errors="ignore")
+        for rule in config.get("deny_patterns", []):
+            if not pattern_applies(rule, fqbn):
+                continue
+            regex = re.compile(rule["regex"], re.MULTILINE)
+            for match in regex.finditer(content):
+                line_no = content[: match.start()].count("\n") + 1
+                findings.append((rule["severity"], rule["name"], str(source_file.relative_to(sketch_dir)), str(line_no), rule["message"]))
+    if not findings:
+        emit(OK, "No risky code patterns detected.")
+        return
+    error_count = 0
+    for severity, name, file_name, line_no, message in findings:
+        icon = FAIL if severity == "error" else WARN
+        emit(icon, f"{severity.upper()}: {name} [{file_name}:{line_no}] - {message}")
+        if severity == "error":
+            error_count += 1
+    if error_count and not allow_risky:
+        raise IotUtilsError("Safety scan found blocking risky patterns. Fix them or re-run with --allow-risky-patterns if the design is intentional.")
+    if error_count and allow_risky:
+        emit(WARN, "Blocking risky patterns were overridden with --allow-risky-patterns.")
+
+
+def compute_build_path(sketch_file: Path, fqbn: str) -> Path:
+    digest = hashlib.sha1(f"{sketch_file}:{fqbn}".encode("utf-8")).hexdigest()[:12]
+    return BUILD_ROOT / "artifacts" / digest
+
+
+def parse_resource_usage(output: str) -> tuple[float | None, float | None]:
+    flash_match = re.search(r"Sketch uses .*?\((\d+(?:\.\d+)?)%\)", output, re.IGNORECASE | re.DOTALL)
+    ram_match = re.search(r"Global variables use .*?\((\d+(?:\.\d+)?)%\)", output, re.IGNORECASE | re.DOTALL)
+    flash = float(flash_match.group(1)) if flash_match else None
+    ram = float(ram_match.group(1)) if ram_match else None
+    return flash, ram
+
+
+def enforce_resource_limits(output: str, config: dict[str, Any]) -> None:
+    flash, ram = parse_resource_usage(output)
+    if flash is None or ram is None:
+        if config.get("require_resource_usage_output", True):
+            missing = []
+            if flash is None:
+                missing.append("flash")
+            if ram is None:
+                missing.append("RAM")
+            raise IotUtilsError(f"Compile output did not include {' and '.join(missing)} usage percentages, so safety thresholds cannot be enforced.")
+        emit(WARN, "Compile output did not include complete flash/RAM percentages; skipping threshold enforcement.")
+        return
+    max_flash = float(config.get("max_flash_percent", 95))
+    max_ram = float(config.get("max_ram_percent", 85))
+    emit(INFO, f"Flash usage: {flash:.1f}% (limit {max_flash:.1f}%)")
+    emit(INFO, f"RAM usage: {ram:.1f}% (limit {max_ram:.1f}%)")
+    if flash > max_flash:
+        raise IotUtilsError(f"Flash usage {flash:.1f}% exceeds configured limit {max_flash:.1f}%.")
+    if ram > max_ram:
+        raise IotUtilsError(f"RAM usage {ram:.1f}% exceeds configured limit {max_ram:.1f}%.")
+    emit(OK, "Resource usage is within configured safety limits.")
+
+
+def compile_sketch(ctx: SketchContext) -> None:
+    ctx.build_path.mkdir(parents=True, exist_ok=True)
+    emit(RUN, f"Compiling sketch for {ctx.fqbn}...")
+    command = ["arduino-cli", "compile", "--warnings", "all", "--fqbn", ctx.fqbn, "--build-path", str(ctx.build_path), str(ctx.sketch_dir)]
+    result = run_command(command, check=False)
+    combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+    if result.returncode != 0:
+        if combined_output:
+            print(combined_output)
+        raise IotUtilsError("Compile failed.")
+    if combined_output:
+        print(combined_output)
+    emit(OK, "Compile completed successfully.")
+    enforce_resource_limits(combined_output, ctx.config)
+
+
+def upload_sketch(ctx: SketchContext) -> None:
+    if not ctx.port:
+        raise IotUtilsError("Upload requested without a selected serial port.")
+    emit(RUN, f"Uploading sketch to {ctx.port}...")
+    command = ["arduino-cli", "upload", "--fqbn", ctx.fqbn, "--input-dir", str(ctx.build_path), "--port", ctx.port, str(ctx.sketch_dir)]
+    result = run_command(command, check=False)
+    combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+    if result.returncode != 0:
+        if combined_output:
+            print(combined_output)
+        raise IotUtilsError("Upload failed.")
+    if combined_output:
+        print(combined_output)
+    emit(DONE, f"Upload completed successfully on {ctx.port}.")
+
+
+def show_resolved_parameters(command_name: str, ctx: SketchContext) -> None:
+    emit(CFG, f"Resolved parameters for {command_name}:")
+    emit(INFO, f"Sketch file: {ctx.sketch_file}")
+    emit(INFO, f"Sketch dir: {ctx.sketch_dir}")
+    emit(INFO, f"FQBN: {ctx.fqbn} (input: {ctx.fqbn_label})")
+    emit(INFO, f"Port: {ctx.port or 'not required'}{'' if not ctx.port_label else f' (input: {ctx.port_label})'}")
+    emit(INFO, f"Build path: {ctx.build_path}")
+    emit(INFO, f"Project config: {ctx.project_config_path or 'not set'}")
+    emit(INFO, f"Global config: {GLOBAL_CONFIG_PATH if GLOBAL_CONFIG_PATH.exists() else 'not set'}")
+
+
+def build_context(args: argparse.Namespace, *, upload: bool) -> SketchContext:
+    ensure_arduino_cli()
+    sketch_file = resolve_sketch(args.sketch)
+    project_config_path = locate_project_config(sketch_file.parent)
+    args.project_dir = sketch_file.parent
+    config = load_effective_config(project_config_path)
+    sketch_dir, staged = prepare_sketch_dir(sketch_file)
+    port, port_label = infer_port(config, args, project_config_path, required=upload)
+    fqbn, fqbn_label = infer_fqbn(config, args.fqbn, port, project_config_path, require_detected_for_port=upload)
+    ensure_core_installed(fqbn)
+    scan_risky_patterns(sketch_dir, fqbn, config, args.allow_risky_patterns)
+    build_path = compute_build_path(sketch_file, fqbn)
+    emit(OK, f"Build artifact directory: {build_path}")
+    ctx = SketchContext(sketch_file=sketch_file, sketch_dir=sketch_dir, build_path=build_path, staged=staged, fqbn=fqbn, fqbn_label=fqbn_label, port=port, port_label=port_label or "", config=config, project_config_path=project_config_path)
+    show_resolved_parameters(args.command, ctx)
+    return ctx
+
+
+def current_project_config_path() -> Path | None:
+    return locate_project_config(Path.cwd())
+
+
+def scope_config_path(scope: str, base_dir: Path) -> Path:
+    return default_project_config_path(base_dir) if scope == "project" else GLOBAL_CONFIG_PATH
+
+
+def resolve_existing_or_detected_port(port_or_alias: str, config: dict[str, Any], project_path: Path | None) -> str:
+    resolved, _ = resolve_port_reference(port_or_alias, config)
+    candidates = all_serial_ports(config, project_path)
+    match = find_port_by_address(candidates, resolved)
+    if match and not match["ignored"]:
+        return resolved
+    if match and match["ignored"]:
+        raise IotUtilsError(f"Port '{resolved}' is currently ignored by safety filters. Choose a usable USB/serial device or adjust ignored_port_patterns in config.")
+    raise IotUtilsError(f"Port '{port_or_alias}' is not currently detected. Run 'iot-utils port list' and choose a connected port.")
+
+
+def port_command_list() -> None:
+    project_path = current_project_config_path()
+    config = load_effective_config(project_path)
+    ensure_arduino_cli()
+    ports = all_serial_ports(config, project_path)
+    if not ports:
+        emit(WARN, "No serial ports detected.")
+        return
+    emit(PORT, "Detected serial ports:")
+    for port in ports:
+        emit(WARN if port["ignored"] else OK, describe_port(port))
+
+
+def port_command_show() -> None:
+    project_path = current_project_config_path()
+    config = load_effective_config(project_path)
+    default_port, default_source = get_saved_default_port(project_path)
+    if default_port:
+        emit(PORT, f"Effective default port: {default_port} ({default_source})")
+    else:
+        emit(WARN, "No saved default port is configured.")
+    project_display = project_path or default_project_config_path(Path.cwd())
+    emit(INFO, f"Global config: {GLOBAL_CONFIG_PATH if GLOBAL_CONFIG_PATH.exists() else 'not set'}")
+    emit(INFO, f"Project config: {project_display if project_path else 'not set'}")
+    emit(INFO, f"Global default port: {load_global_config().get('default_port') or 'not set'}")
+    emit(INFO, f"Project default port: {(load_project_config(project_path).get('default_port') or 'not set') if project_path else 'not set'}")
+    aliases = port_aliases(config)
+    fqbn_map = fqbn_aliases(config)
+    if aliases:
+        emit(PORT, "Known port aliases:")
+        for alias, value in sorted(aliases.items()):
+            emit(INFO, f"{alias} -> {value}")
+    else:
+        emit(INFO, "No port aliases configured.")
+    emit(CFG, "Known FQBN aliases:")
+    for alias, value in sorted(fqbn_map.items()):
+        emit(INFO, f"{alias} -> {value}")
+
+
+def port_command_set(args: argparse.Namespace) -> None:
+    project_path = current_project_config_path()
+    config = load_effective_config(project_path)
+    ensure_arduino_cli()
+    scope = "project" if args.project else "global"
+    target_path = scope_config_path(scope, Path.cwd())
+    target_config = read_yaml_file(target_path)
+    resolved_port = resolve_existing_or_detected_port(args.port_or_alias, config, project_path)
+    target_config["default_port"] = resolved_port
+    if args.alias:
+        aliases = target_config.get("port_aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+        aliases[args.alias] = resolved_port
+        target_config["port_aliases"] = aliases
+        emit(SAVE, f"Saved alias '{args.alias}' -> {resolved_port} in {scope} config")
+    persist_yaml_config(target_path, target_config)
+    emit(SAVE, f"Saved {scope} default port: {resolved_port}")
+    emit(INFO, f"Config file: {target_path}")
+
+
+def port_command_clear(args: argparse.Namespace) -> None:
+    scope = "project" if args.project else "global"
+    target_path = scope_config_path(scope, Path.cwd())
+    target_config = read_yaml_file(target_path)
+    changed = False
+    if args.alias:
+        aliases = target_config.get("port_aliases", {})
+        if isinstance(aliases, dict) and args.alias in aliases:
+            aliases.pop(args.alias)
+            target_config["port_aliases"] = aliases
+            emit(SAVE, f"Removed alias '{args.alias}' from {scope} config")
+            changed = True
+        else:
+            emit(WARN, f"Alias '{args.alias}' was not set in {scope} config")
+    else:
+        if "default_port" in target_config:
+            target_config.pop("default_port")
+            emit(SAVE, f"Cleared {scope} default port")
+            changed = True
+        else:
+            emit(WARN, f"No {scope} default port was set")
+    if changed:
+        persist_yaml_config(target_path, target_config)
+        emit(INFO, f"Config file: {target_path}")
+
+
+def config_command_init(args: argparse.Namespace) -> None:
+    scope = "project" if args.project else "global"
+    target_path = scope_config_path(scope, Path.cwd())
+    if target_path.exists() and not args.force:
+        raise IotUtilsError(f"Config file already exists: {target_path}. Use --force to overwrite.")
+    initial = {
+        "default_fqbn": "esp32",
+        "fqbn_aliases": {"esp32": "esp32:esp32:esp32wrover", "uno": "arduino:avr:uno", "nano": "arduino:avr:nano", "mega": "arduino:avr:mega"},
+        "port_aliases": {},
+    }
+    persist_yaml_config(target_path, initial)
+    emit(SAVE, f"Wrote {scope} config template: {target_path}")
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="iot-utils", description="Simple, safety-first Arduino/ESP32 verify and upload helper.", epilog="Examples: iot-utils verify blink.ino --fqbn esp32 | iot-utils port list | iot-utils config init --global")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_common_arguments(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("sketch", help="Path to a .ino sketch file")
+        subparser.add_argument("--fqbn", help="Board FQBN or alias, for example esp32 or esp32:esp32:esp32wrover")
+        subparser.add_argument("--port", help="Serial port or saved alias, for example /dev/cu.usbserial-10 or esp32-main")
+        subparser.add_argument("--yes", action="store_true", help="Auto-confirm safe replacement prompts when possible")
+        subparser.add_argument("--no-input", action="store_true", help="Fail instead of prompting for confirmation")
+        subparser.add_argument("--allow-risky-patterns", action="store_true", help="Continue even if blocking risky code patterns are detected")
+
+    verify_parser = subparsers.add_parser("verify", help="Run safety checks and compile a sketch")
+    add_common_arguments(verify_parser)
+
+    upload_parser = subparsers.add_parser("upload", help="Verify first, then upload the sketch")
+    add_common_arguments(upload_parser)
+
+    port_parser = subparsers.add_parser("port", help="List, save, or clear serial port defaults")
+    port_subparsers = port_parser.add_subparsers(dest="port_command", required=True)
+    port_subparsers.add_parser("list", help="Show detected serial ports, board hints, aliases, and defaults")
+    port_subparsers.add_parser("show", help="Show effective global/project port and alias settings")
+    port_set_parser = port_subparsers.add_parser("set", help="Save a default port and optional alias")
+    port_set_parser.add_argument("port_or_alias", help="Detected port path or an existing alias")
+    port_set_parser.add_argument("--alias", help="Alias name to save for this port, for example esp32-main")
+    port_scope = port_set_parser.add_mutually_exclusive_group()
+    port_scope.add_argument("--global", action="store_true", help="Save to ~/.config/iot-utils/config.yml (default)")
+    port_scope.add_argument("--project", action="store_true", help="Save to a project-local .iot-utils.yml")
+    port_clear_parser = port_subparsers.add_parser("clear", help="Clear a saved default port or alias")
+    port_clear_parser.add_argument("--alias", help="Alias name to remove instead of clearing the default port")
+    clear_scope = port_clear_parser.add_mutually_exclusive_group()
+    clear_scope.add_argument("--global", action="store_true", help="Clear from ~/.config/iot-utils/config.yml (default)")
+    clear_scope.add_argument("--project", action="store_true", help="Clear from project-local .iot-utils.yml")
+
+    config_parser = subparsers.add_parser("config", help="Create or manage YAML config templates")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+    config_init_parser = config_subparsers.add_parser("init", help="Create a starter YAML config with FQBN aliases")
+    cfg_scope = config_init_parser.add_mutually_exclusive_group()
+    cfg_scope.add_argument("--global", action="store_true", help="Write ~/.config/iot-utils/config.yml (default)")
+    cfg_scope.add_argument("--project", action="store_true", help="Write a project-local .iot-utils.yml")
+    config_init_parser.add_argument("--force", action="store_true", help="Overwrite existing config file")
+
+    return parser
+
+
+def main() -> None:
+    parser = make_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "verify":
+            emit(INFO, "Starting verify workflow...")
+            ctx = build_context(args, upload=False)
+            compile_sketch(ctx)
+            emit(DONE, "Verify workflow finished successfully.")
+            return
+        if args.command == "upload":
+            emit(INFO, "Starting upload workflow (includes verify)...")
+            ctx = build_context(args, upload=True)
+            compile_sketch(ctx)
+            upload_sketch(ctx)
+            return
+        if args.command == "port":
+            if args.port_command == "list":
+                port_command_list()
+                return
+            if args.port_command == "show":
+                port_command_show()
+                return
+            if args.port_command == "set":
+                port_command_set(args)
+                return
+            if args.port_command == "clear":
+                port_command_clear(args)
+                return
+        if args.command == "config":
+            if args.config_command == "init":
+                config_command_init(args)
+                return
+        parser.error(f"Unknown command: {args.command}")
+    except IotUtilsError as exc:
+        fail(str(exc))
+
+
+if __name__ == "__main__":
+    main()

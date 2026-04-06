@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">iot-utils hero banner</title>
+  <desc id="desc">A hero banner for iot-utils with microcontroller and serial upload visuals.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="50%" stop-color="#0f766e" />
+      <stop offset="100%" stop-color="#0369a1" />
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.04" />
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#00111a" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)" />
+  <g opacity="0.18">
+    <circle cx="1120" cy="120" r="180" fill="#22d3ee" />
+    <circle cx="180" cy="560" r="220" fill="#34d399" />
+    <circle cx="980" cy="520" r="120" fill="#facc15" />
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="92" y="92" rx="36" ry="36" width="1096" height="456" fill="url(#card)" stroke="rgba(255,255,255,0.2)" />
+  </g>
+  <g fill="#e2e8f0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+    <text x="140" y="210" font-size="34" font-weight="700" opacity="0.95">🔌 Verify • Upload • Port Profiles</text>
+    <text x="140" y="305" font-size="88" font-weight="800">iot-utils</text>
+    <text x="140" y="370" font-size="34" opacity="0.92">Simple, safety-first Arduino and ESP32 workflows powered by arduino-cli.</text>
+    <text x="140" y="430" font-size="28" opacity="0.82">✅ compile gates  ✅ port aliases  ✅ safer uploads  ✅ ESP32 WROVER ready</text>
+  </g>
+  <g transform="translate(865 164)">
+    <rect x="0" y="0" width="250" height="210" rx="24" fill="#082f49" opacity="0.88" stroke="#7dd3fc" stroke-opacity="0.4"/>
+    <rect x="26" y="34" width="198" height="110" rx="18" fill="#0f172a" stroke="#67e8f9" stroke-opacity="0.5"/>
+    <circle cx="54" cy="173" r="10" fill="#22c55e"/>
+    <circle cx="84" cy="173" r="10" fill="#f59e0b"/>
+    <circle cx="114" cy="173" r="10" fill="#38bdf8"/>
+    <rect x="146" y="164" width="68" height="18" rx="9" fill="#14b8a6" opacity="0.9"/>
+    <text x="34" y="73" fill="#e0f2fe" font-size="18" font-family="monospace">ESP32</text>
+    <text x="34" y="101" fill="#a5f3fc" font-size="15" font-family="monospace">verify → upload</text>
+    <text x="34" y="126" fill="#93c5fd" font-size="15" font-family="monospace">port: usbserial-10</text>
+  </g>
+  <g transform="translate(885 415)">
+    <path d="M0 0 C40 0 60 -30 98 -30 C136 -30 150 0 198 0" fill="none" stroke="#fde68a" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="0" cy="0" r="10" fill="#fef08a"/>
+    <circle cx="198" cy="0" r="10" fill="#fef08a"/>
+  </g>
+</svg>

@@ -1,0 +1,48 @@
+{
+  "default_fqbn": "esp32",
+  "fqbn_aliases": {
+    "esp32": "esp32:esp32:esp32wrover",
+    "uno": "arduino:avr:uno",
+    "nano": "arduino:avr:nano",
+    "mega": "arduino:avr:mega"
+  },
+  "max_flash_percent": 95,
+  "max_ram_percent": 85,
+  "require_resource_usage_output": true,
+  "ignored_port_patterns": [
+    "Bluetooth-Incoming-Port",
+    "debug-console"
+  ],
+  "deny_patterns": [
+    {
+      "name": "Infinite loop without scheduler hints",
+      "severity": "error",
+      "regex": "\\bwhile\\s*\\(\\s*(?:true|1)\\s*\\)|\\bfor\\s*\\(\\s*;\\s*;\\s*\\)",
+      "message": "Avoid unconditional infinite loops unless you intentionally override with --allow-risky-patterns. Tight loops can starve Wi-Fi, serial, and watchdog handling."
+    },
+    {
+      "name": "ESP32 strap pin configured as output",
+      "severity": "error",
+      "regex": "\\bpinMode\\s*\\(\\s*(0|2|12|15)\\s*,\\s*OUTPUT\\s*\\)",
+      "boards": [
+        "esp32:esp32"
+      ],
+      "message": "GPIO 0, 2, 12, and 15 are boot/strap-sensitive on many ESP32 boards. Driving them can break boot or attached hardware."
+    },
+    {
+      "name": "ESP32 strap pin driven HIGH",
+      "severity": "error",
+      "regex": "\\bdigitalWrite\\s*\\(\\s*(0|2|12|15)\\s*,\\s*HIGH\\s*\\)",
+      "boards": [
+        "esp32:esp32"
+      ],
+      "message": "Driving strap pins HIGH can interfere with boot mode or connected peripherals."
+    },
+    {
+      "name": "Direct relay startup risk",
+      "severity": "warning",
+      "regex": "\\bdigitalWrite\\s*\\([^,]+,\\s*HIGH\\s*\\)\\s*;",
+      "message": "Review startup writes if a relay, MOSFET, or motor driver is attached. A HIGH at boot may switch power unexpectedly."
+    }
+  ]
+}
